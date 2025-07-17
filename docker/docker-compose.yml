@@ -1,0 +1,162 @@
+version: '3.8'
+
+services:
+  # n8n ワークフローエンジン
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: tubecraft-n8n
+    restart: unless-stopped
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-tubecraft2024}
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://n8n:5678/
+      - N8N_METRICS=true
+      - EXECUTIONS_PROCESS=main
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB:-tubecraft_db}
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_USER=${POSTGRES_USER:-tubecraft}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-tubecraft2024}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ../data:/data
+    networks:
+      - tubecraft-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL データベース
+  postgres:
+    image: postgres:15-alpine
+    container_name: tubecraft-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-tubecraft}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-tubecraft2024}
+      - POSTGRES_DB=${POSTGRES_DB:-tubecraft_db}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./shared/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - tubecraft-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tubecraft} -d ${POSTGRES_DB:-tubecraft_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Ollama (LLM)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: tubecraft-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - tubecraft-network
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: '4'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # GPU使用する場合は以下のコメントを外す
+    # runtime: nvidia
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
+
+  # コンテンツジェネレーターサービス
+  generator:
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    container_name: tubecraft-generator
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-tubecraft}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-tubecraft2024}
+      - POSTGRES_DB=${POSTGRES_DB:-tubecraft_db}
+      - DATA_PATH=/data
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - ../src/generator:/app
+      - ../data:/data
+      - ../src/common:/app/common:ro
+    networks:
+      - tubecraft-network
+    depends_on:
+      ollama:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # マネージャーサービス（Phase 2用）
+  # manager:
+  #   build:
+  #     context: ./manager
+  #     dockerfile: Dockerfile
+  #   container_name: tubecraft-manager
+  #   restart: unless-stopped
+  #   environment:
+  #     - POSTGRES_HOST=postgres
+  #     - POSTGRES_PORT=5432
+  #     - POSTGRES_USER=${POSTGRES_USER:-tubecraft}
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-tubecraft2024}
+  #     - POSTGRES_DB=${POSTGRES_DB:-tubecraft_db}
+  #     - DATA_PATH=/data
+  #   volumes:
+  #     - ../src/manager:/app
+  #     - ../data:/data:ro
+  #     - ../src/common:/app/common:ro
+  #   ports:
+  #     - "8001:8001"
+  #   networks:
+  #     - tubecraft-network
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+
+volumes:
+  n8n_data:
+    driver: local
+  postgres_data:
+    driver: local
+  ollama_data:
+    driver: local
+
+networks:
+  tubecraft-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
